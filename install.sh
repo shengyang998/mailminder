@@ -27,9 +27,8 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 echo "安装 mailminder 命令……"
-# Uninstall first: `uv tool install --force` can reuse a cached build of an older checkout.
-uv tool uninstall mailminder >/dev/null 2>&1 || true
-uv tool install --quiet .
+# --reinstall rebuilds from this checkout instead of reusing a cached build of an older one.
+uv tool install --reinstall --quiet .
 BIN="$(uv tool dir --bin)/mailminder"
 echo "已安装：$BIN"
 case ":$PATH:" in

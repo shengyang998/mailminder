@@ -9,11 +9,10 @@ import os
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from . import config, keychain
+from . import accounts, config, keychain
 from .caldav import CalDAV
 from .extract import ping
 from .ics import Event, to_ics
-from .mailbox import IMAPMailbox
 
 
 def _check(name: str, fn) -> dict:
@@ -40,11 +39,7 @@ def run_checks(cfg: dict, *, write_test: bool = False) -> list[dict]:
 
     for acct in cfg["accounts"]:
         def mail(acct=acct):
-            aid = config.mail_secret_account(acct)
-            password = keychain.get(keychain.MAIL_SERVICE, aid)
-            if not password:
-                raise RuntimeError("钥匙串里没有这个邮箱的密码")
-            with IMAPMailbox(acct["host"], int(acct.get("port", 993)), acct["username"], password) as mb:
+            with accounts.open_mailbox(acct) as mb:
                 opened = []
                 for mbox in acct.get("mailboxes") or ["INBOX"]:
                     mb.select(mbox)

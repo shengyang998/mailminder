@@ -15,12 +15,13 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from . import config, keychain
+from . import accounts, config, keychain
 from .caldav import CalDAV, CalDAVError
 from .extract import HarnessError, extract
 from .ics import Event, to_ics
 from .ledger import Ledger
 from .mailbox import IMAPMailbox, MailError, Message
+from .oauth import OAuthError
 from .plan import Planned, plan
 
 ALERT_AFTER_FAILED_RUNS = 3
@@ -66,38 +67,46 @@ def run_lock():
         f.close()
 
 
-def _scan(cfg, ledger: Ledger, since_days, budget, mailbox_factory, secret):
+def _scan(cfg, ledger: Ledger, since_days, budget, mailbox_factory, secret, store_secret):
+    """New messages from every account; an account that fails is reported and the rest still run."""
     scans: list[Scan] = []
     fresh: list[tuple[Scan, Message]] = []
-    today = datetime.now(ZoneInfo(cfg["timezone"])).date()
+    errors: list[str] = []
     for acct in cfg["accounts"]:
-        aid = config.mail_secret_account(acct)
-        password = secret(keychain.MAIL_SERVICE, aid)
-        if not password:
-            raise config.ConfigError(f"钥匙串里没有 {aid} 的密码，运行 mailminder account password 补上")
-        with mailbox_factory(acct["host"], int(acct.get("port", 993)), acct["username"], password) as mb:
-            for mbox in acct.get("mailboxes") or ["INBOX"]:
-                uidvalidity, uidnext = mb.select(mbox)
-                cur = ledger.cursor(aid, mbox)
-                if since_days is not None or cur is None or cur[0] != uidvalidity:
-                    days = cfg["lookback_days"] if since_days is None else since_days
-                    candidates = mb.uids_since(today - timedelta(days=days))
+        try:
+            budget = _scan_account(cfg, acct, ledger, since_days, budget, mailbox_factory, secret, store_secret,
+                                   scans, fresh)
+        except (MailError, OAuthError, config.ConfigError, OSError) as e:
+            errors.append(f"{acct.get('name') or ''} {acct['username']}：{e}".strip())
+    return scans, fresh, errors
+
+
+def _scan_account(cfg, acct, ledger, since_days, budget, mailbox_factory, secret, store_secret, scans, fresh) -> int:
+    today = datetime.now(ZoneInfo(cfg["timezone"])).date()
+    aid = config.mail_secret_account(acct)
+    with accounts.open_mailbox(acct, mailbox_factory, secret, store_secret) as mb:
+        for mbox in acct.get("mailboxes") or ["INBOX"]:
+            uidvalidity, uidnext = mb.select(mbox)
+            cur = ledger.cursor(aid, mbox)
+            if since_days is not None or cur is None or cur[0] != uidvalidity:
+                days = cfg["lookback_days"] if since_days is None else since_days
+                candidates = mb.uids_since(today - timedelta(days=days))
+            else:
+                candidates = mb.uids_after(cur[1])
+            candidates = [u for u in candidates if not ledger.seen(aid, mbox, uidvalidity, u)]
+            take = candidates[:max(budget, 0)]
+            budget -= len(take)
+            scan = Scan(aid, mbox, uidvalidity, uidnext, take, len(take) == len(candidates))
+            scans.append(scan)
+            got = mb.fetch(mbox, take) if take else []
+            for uid in set(take) - {m.uid for m in got}:  # deleted between SEARCH and FETCH
+                ledger.mark_seen(aid, mbox, uidvalidity, uid)
+            for m in got:
+                if ledger.known(m.key):  # same mail already read in another folder/account
+                    ledger.mark_seen(aid, mbox, uidvalidity, m.uid)
                 else:
-                    candidates = mb.uids_after(cur[1])
-                candidates = [u for u in candidates if not ledger.seen(aid, mbox, uidvalidity, u)]
-                take = candidates[:max(budget, 0)]
-                budget -= len(take)
-                scan = Scan(aid, mbox, uidvalidity, uidnext, take, len(take) == len(candidates))
-                scans.append(scan)
-                got = mb.fetch(mbox, take) if take else []
-                for uid in set(take) - {m.uid for m in got}:  # deleted between SEARCH and FETCH
-                    ledger.mark_seen(aid, mbox, uidvalidity, uid)
-                for m in got:
-                    if ledger.known(m.key):  # same mail already read in another folder/account
-                        ledger.mark_seen(aid, mbox, uidvalidity, m.uid)
-                    else:
-                        fresh.append((scan, m))
-    return scans, fresh
+                    fresh.append((scan, m))
+    return budget
 
 
 def _extract(cfg, ledger: Ledger, fresh, now, extractor, log) -> tuple[int, str | None]:
@@ -215,18 +224,20 @@ def _alert(cfg, ledger: Ledger, error: str, now: datetime, caldav_factory, secre
 
 def run(cfg: dict, *, dry_run: bool = False, since_days: int | None = None, limit: int | None = None,
         now: datetime | None = None, mailbox_factory=IMAPMailbox, caldav_factory=CalDAV,
-        extractor=extract, secret=keychain.get, log=print) -> Result:
+        extractor=extract, secret=keychain.get, store_secret=keychain.put, log=print) -> Result:
     now = now or datetime.now(timezone.utc)
     res = Result()
     with run_lock():
         ledger = Ledger(config.state_dir() / "state.db")
         run_id = ledger.start_run(dry_run)
         try:
-            scans, fresh = _scan(cfg, ledger, since_days, limit or int(cfg["max_per_run"]), mailbox_factory, secret)
+            scans, fresh, problems = _scan(cfg, ledger, since_days, limit or int(cfg["max_per_run"]),
+                                           mailbox_factory, secret, store_secret)
             res.fetched = len(fresh)
-            res.extracted, res.error = _extract(cfg, ledger, fresh, now, extractor, log)
+            res.extracted, model_error = _extract(cfg, ledger, fresh, now, extractor, log)
             _advance_cursors(ledger, scans)
             _apply(cfg, ledger, now, dry_run, caldav_factory, secret, res)
+            res.error = "；".join(problems + ([model_error] if model_error else [])) or None
         except (MailError, CalDAVError, config.ConfigError, OSError) as e:
             res.error = str(e)
         except Exception as e:

@@ -34,7 +34,7 @@ class FakeMailbox:
     def __init__(self, server):
         self.server = server
 
-    def __call__(self, host, port, username, password):
+    def __call__(self, host, port, username, password, **kw):
         assert password == "mail-secret"
         return self
 
@@ -239,3 +239,19 @@ def test_concurrent_runs_are_refused(env):
     with pipeline.run_lock():
         with pytest.raises(pipeline.RunLocked):
             run(FakeModel({}))
+
+
+def test_one_broken_account_does_not_stop_the_others(env):
+    cfg, server, cal, run, _ = env
+    cfg["accounts"].insert(0, {"name": "Work", "host": "imap.broken", "port": 993, "username": "boss",
+                               "mailboxes": ["INBOX"]})
+    server.add(1, "评审会")
+    model = FakeModel({"评审会": [ev("项目评审会", "2026-09-25T15:00", "评审会")]})
+
+    def secret_missing_for_work(service, account):
+        return None if account.startswith("boss@") else secret(service, account)
+
+    r = pipeline.run(cfg, now=NOW, mailbox_factory=FakeMailbox(server), caldav_factory=cal, extractor=model,
+                     secret=secret_missing_for_work, log=lambda *_: None)
+    assert r.created == 1 and len(cal.items) == 1
+    assert r.error and "boss" in r.error and "钥匙串" in r.error

@@ -1,7 +1,7 @@
 """Secrets live only in the login Keychain, via /usr/bin/security.
 
 Items are created and read by the same binary, so the scheduled run under
-launchd reads them without an access prompt.
+launchd reads them without an access prompt. Secrets never go through argv.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import subprocess
 SECURITY = "/usr/bin/security"
 MAIL_SERVICE = "mailminder.mail"
 CALENDAR_SERVICE = "mailminder.calendar"
+PROMPT_LIMIT = 128  # security's password prompt silently truncates longer input
 
 
 class KeychainError(RuntimeError):
@@ -26,17 +27,22 @@ def get(service: str, account: str) -> str | None:
 def put(service: str, account: str, secret: str, label: str | None = None) -> None:
     if not secret or "\n" in secret:
         raise KeychainError("密码为空或含换行")
-    args = [SECURITY, "add-generic-password", "-U", "-s", service, "-a", account]
-    if label:
-        args += ["-l", label]
-    # A trailing bare -w makes security prompt for the secret, and it reads the
-    # prompt answers (entry + retype) from stdin, so the secret never shows in argv.
-    args.append("-w")
-    r = subprocess.run(args, input=f"{secret}\n{secret}\n", capture_output=True, text=True)
-    if r.returncode != 0:
-        raise KeychainError(f"写入钥匙串失败: {r.stderr.strip()}")
+    fields = [service, account, label or ""]
+    if not any('"' in f or "\\" in f for f in fields + [secret]):
+        # Interactive mode reads the whole command from stdin, so the secret stays
+        # out of argv and there is no length limit (OAuth refresh tokens run ~2 KB).
+        cmd = f'add-generic-password -U -s "{service}" -a "{account}"'
+        cmd += f' -l "{label}"' if label else ""
+        r = subprocess.run([SECURITY, "-i"], input=f'{cmd} -w "{secret}"\n', capture_output=True, text=True)
+    elif len(secret) <= PROMPT_LIMIT and not any('"' in f for f in fields):
+        # A bare trailing -w prompts for the secret (entry + retype), answered on stdin.
+        args = [SECURITY, "add-generic-password", "-U", "-s", service, "-a", account]
+        args += ["-l", label] if label else []
+        r = subprocess.run(args + ["-w"], input=f"{secret}\n{secret}\n", capture_output=True, text=True)
+    else:
+        raise KeychainError("密码含引号且过长，存不进钥匙串")
     if get(service, account) != secret:
-        raise KeychainError("写入钥匙串后读回不一致")
+        raise KeychainError(f"写入钥匙串失败: {r.stderr.strip() or '读回不一致'}")
 
 
 def delete(service: str, account: str) -> bool:

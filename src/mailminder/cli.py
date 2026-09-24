@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from . import __version__, config, doctor, icloud, keychain, launchd, pipeline
+from . import __version__, accounts, config, doctor, icloud, keychain, launchd, oauth, pipeline
 from .caldav import CalDAV, CalDAVError
 from .extract import ping
 from .ics import Event, to_ics
@@ -186,12 +186,86 @@ def try_login(host: str, port: int, usernames: list[str], password: str) -> tupl
     return None, error
 
 
-def setup_mail(cfg: dict) -> tuple[dict, str]:
+OUTLOOK_APP_HELP = """Outlook 要用微软账号授权登录（微软已不接受密码），需要先在微软注册一个应用拿到「应用 ID」（免费、一次性，约 5 分钟）：
+  1) 打开 https://entra.microsoft.com 登录（个人微软账号若提示没有目录，先在 https://azure.microsoft.com/free 开一个免费 Azure 账户）
+  2) 应用注册 → 新注册：名称填 Mailminder；支持的账户类型选「任何组织目录中的帐户和个人 Microsoft 帐户」；
+     重定向 URI 不用填
+  3) 注册后进「身份验证」，把「允许公共客户端流」设为「是」，保存
+  4) 在「概述」页复制「应用程序(客户端) ID」
+详细图文步骤见 README 的「Outlook」一节。"""
+
+
+OUTLOOK_DOMAINS = ("@outlook.com", "@hotmail.com", "@live.com", "@msn.com", "@outlook.cn",
+                   "@hotmail.co.uk", "@live.cn", "@outlook.jp")
+
+
+def microsoft_sign_in(client_id: str, tenant: str) -> tuple[dict, str]:
+    """Device-code sign-in; returns (token response, tenant that worked)."""
+    while True:
+        try:
+            code = oauth.start_device_login(client_id, tenant)
+            say(f"用浏览器打开 {oauth.DEVICE_PAGE} ，输入代码：{code.user_code}")
+            say("（手机上打开也行，15 分钟内有效。用要读的那个邮箱账号登录，点「接受」后回到这里，这边会自动继续）")
+            tokens = oauth.finish_device_login(client_id, tenant, code)
+            say("  ✓ 微软账号已授权")
+            return tokens, tenant
+        except oauth.OAuthError as e:
+            say(f"  ✗ {e}")
+            if "AADSTS9002331" in str(e) and tenant != "consumers":
+                tenant = "consumers"  # app registered for personal accounts only
+                continue
+            if "AADSTS50194" in str(e):
+                tenant = ask("这个应用是单租户的，填它所在目录的「目录(租户) ID」")
+                continue
+            if not ask_yes("重试？"):
+                raise SystemExit(1) from None
+
+
+def setup_outlook(cfg: dict) -> tuple[dict, None]:
+    known = next((a for a in cfg["accounts"] if accounts.is_microsoft(a)), {})
+    client_id = known.get("client_id") or oauth.DEFAULT_CLIENT_ID
+    if not client_id:
+        say(OUTLOOK_APP_HELP)
+        client_id = ask("粘贴应用(客户端) ID")
+    tokens, tenant = microsoft_sign_in(client_id, known.get("tenant") or "common")
+    address = oauth.signed_in_address(tokens)
+    if not address or not address.lower().endswith(OUTLOOK_DOMAINS):
+        # A Microsoft account opened with another provider's address (e.g. Gmail) signs in with
+        # that address, but Outlook's IMAP wants the mailbox's own @outlook.com/@hotmail.com one.
+        address = ask("你的 Outlook 邮箱地址（@outlook.com / @hotmail.com / @live.com，公司邮箱填公司地址）",
+                      address or "")
+    while True:
+        say(f"正在登录邮箱 {address}……")
+        try:
+            with IMAPMailbox(oauth.IMAP_HOST, 993, address, "", oauth_token=tokens["access_token"]) as mb:
+                mb.select("INBOX")
+            break
+        except MailError as e:
+            say(f"  ✗ {e}")
+            say("  常见原因：① 地址要填邮箱本身的地址（不是注册微软账号用的其他邮箱）；"
+                "② Outlook 网页版 设置 → 邮件 → 转发和 IMAP →「允许设备和应用使用 IMAP」没打开；"
+                "③ 公司邮箱被管理员关了 IMAP。")
+            retry = ask("换个地址再试（直接回车 = 放弃）")
+            if not retry:
+                raise SystemExit(1) from None
+            address = retry
+    account = {"name": "Outlook", "host": oauth.IMAP_HOST, "port": 993, "username": address,
+               "mailboxes": ["INBOX"], "auth": accounts.MICROSOFT, "client_id": client_id, "tenant": tenant}
+    key = config.mail_secret_account(account)
+    keychain.put(keychain.MAIL_SERVICE, key, tokens["refresh_token"], label=f"Mailminder 邮箱 {address}")
+    cfg["accounts"] = [a for a in cfg["accounts"] if config.mail_secret_account(a) != key] + [account]
+    say(f"  ✓ 已登录 {address}；钥匙串里存的是微软给的授权，不是你的密码")
+    return account, None
+
+
+def setup_mail(cfg: dict) -> tuple[dict, str | None]:
     det = icloud.detect()
     icloud_label = f"iCloud 邮箱 {det.mail_address}（这台 Mac 登录的账户）" if det and det.mail_address else "iCloud 邮箱"
-    options = [("icloud", icloud_label)] + [(k, v[0]) for k, v in MAIL_PRESETS.items()]
-    options.append(("imap", "其他邮箱（手动填 IMAP 服务器）"))
+    options = [("icloud", icloud_label), ("outlook", "Outlook / Hotmail / Microsoft 365（用微软账号授权）")]
+    options += [(k, v[0]) for k, v in MAIL_PRESETS.items()] + [("imap", "其他邮箱（手动填 IMAP 服务器）")]
     kind = choose("读哪个邮箱？", options)
+    if kind == "outlook":
+        return setup_outlook(cfg)
     port = 993
     if kind == "icloud":
         name, host = "iCloud", (det.imap_host if det and det.imap_host else icloud.FALLBACK_IMAP)
@@ -488,8 +562,9 @@ def cmd_account(args) -> int:
     if args.action in (None, "list"):
         for i, a in enumerate(cfg["accounts"], 1):
             has = keychain.get(keychain.MAIL_SERVICE, config.mail_secret_account(a))
+            kind = "微软授权" if accounts.is_microsoft(a) else "密码"
             say(f"  {i}) {_account_label(a)} · {a['host']} · {', '.join(a.get('mailboxes') or ['INBOX'])}"
-                f" · {'密码 ✓' if has else '缺密码'}")
+                f" · {kind} {'✓' if has else '缺'}")
         cal = cfg["calendar"]
         say(f"  日历：{cal['username']} →「{cal['calendar_name']}」")
         say("命令：mailminder account add · remove · password · folders")
@@ -497,6 +572,7 @@ def cmd_account(args) -> int:
     if args.action == "add":
         setup_mail(cfg)
         config.save(cfg)
+        first_run(cfg)  # the new mailbox's recent mail: show first, write only after a yes
         return 0
     if args.action == "remove":
         options = [(config.mail_secret_account(a), _account_label(a)) for a in cfg["accounts"]]
@@ -522,6 +598,13 @@ def cmd_account(args) -> int:
     options = [(config.mail_secret_account(a), f"邮箱 {_account_label(a)}") for a in cfg["accounts"]]
     options.append(("calendar", f"日历 {cfg['calendar']['username']}"))
     key = choose("更新哪个密码？", options)
+    acct = next((a for a in cfg["accounts"] if config.mail_secret_account(a) == key), None)
+    if acct and accounts.is_microsoft(acct):
+        tokens, acct["tenant"] = microsoft_sign_in(acct["client_id"], acct.get("tenant") or "common")
+        keychain.put(keychain.MAIL_SERVICE, key, tokens["refresh_token"], label=f"Mailminder 邮箱 {acct['username']}")
+        config.save(cfg)
+        say("  ✓ 已重新授权")
+        return 0
     password = ask_secret("新密码")
     if key == "calendar":
         cal = cfg["calendar"]
@@ -653,7 +736,7 @@ def main(argv: list[str] | None = None) -> int:
         p.error("用法：mailminder config set <key> <value>")
     try:
         return args.func(args) or 0
-    except (config.ConfigError, CalDAVError, MailError, keychain.KeychainError) as e:
+    except (config.ConfigError, CalDAVError, MailError, keychain.KeychainError, oauth.OAuthError) as e:
         say(str(e))
         return 1
     except KeyboardInterrupt:

@@ -158,8 +158,10 @@ def _quote(mailbox: str) -> str:
 
 
 class IMAPMailbox:
-    def __init__(self, host: str, port: int, username: str, password: str, timeout: float = 60):
+    def __init__(self, host: str, port: int, username: str, password: str, timeout: float = 60,
+                 oauth_token: str | None = None):
         self.host, self.port, self.username, self._password, self.timeout = host, port, username, password, timeout
+        self._token = oauth_token  # set for OAuth mailboxes (Outlook): SASL XOAUTH2 instead of LOGIN
         self.imap: imaplib.IMAP4_SSL | None = None
 
     def __enter__(self) -> IMAPMailbox:
@@ -168,10 +170,15 @@ class IMAPMailbox:
         except OSError as e:
             raise MailError(f"连不上邮件服务器 {self.host}:{self.port}（{e}）") from None
         try:
-            self.imap.login(self.username, self._password)
+            if self._token:
+                raw = f"user={self.username}\x01auth=Bearer {self._token}\x01\x01".encode()
+                self.imap.authenticate("XOAUTH2", lambda _: raw)
+            else:
+                self.imap.login(self.username, self._password)
         except imaplib.IMAP4.error as e:
             self.imap.shutdown()
-            raise MailError(f"邮箱登录失败：账号或 App 专用密码不对（{e}）") from None
+            what = "登录令牌被拒（邮箱没开 IMAP，或令牌不含 IMAP 权限）" if self._token else "账号或 App 专用密码不对"
+            raise MailError(f"邮箱登录失败：{what}（{e}）") from None
         if "ID" in self.imap.capabilities:
             # NetEase (163/126) refuses SELECT from clients that never identify
             # themselves ("Unsafe Login"); RFC 2971 ID is harmless elsewhere.

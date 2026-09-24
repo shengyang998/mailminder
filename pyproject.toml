@@ -20,6 +20,11 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/mailminder"]
 
+[tool.uv]
+# uv rebuilds a local project only when a cache key changes (pyproject.toml by
+# default); without the sources here an upgrade silently reinstalls the old build.
+cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.py" }]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["live: talks to the real mailbox / calendar / model; runs only with MAILMINDER_LIVE=1"]
