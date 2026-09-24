@@ -231,7 +231,7 @@ def test_repeated_failures_put_one_alert_on_the_calendar(env):
     run(model)
     run(model)
     alerts = [ics for href, ics in cal.items.items() if "alert" in href]
-    assert len(alerts) == 1 and "Mailminder 出错了" in alerts[0]
+    assert len(alerts) == 1 and "Mailminder 出错了" in alerts[0] and "Not logged in" in alerts[0]
 
 
 def test_concurrent_runs_are_refused(env):

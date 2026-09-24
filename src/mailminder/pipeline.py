@@ -211,9 +211,10 @@ def _alert(cfg, ledger: Ledger, error: str, now: datetime, caldav_factory, secre
     if ledger.get_meta("last_alert") == today:
         return
     cal = cfg["calendar"]
-    ev = Event(uid=f"mailminder-alert-{today}", title="Mailminder 出错了：邮件提醒暂停中",
+    # Accounts fail independently, so say what broke rather than claiming everything stopped.
+    ev = Event(uid=f"mailminder-alert-{today}", title="Mailminder 出错了，需要处理一下",
                start=now + timedelta(minutes=5), alarms=[timedelta(0)],
-               description=f"{error}\n\n在 Mac 上运行 mailminder doctor 查看原因。")
+               description=f"{error}\n\n没出错的邮箱照常在处理。在 Mac 上运行 mailminder doctor 查看原因。")
     try:
         dav = caldav_factory(cal["url"], cal["username"], secret(keychain.CALENDAR_SERVICE, cal["username"]) or "")
         dav.put_event(cal["calendar_url"] + ev.uid + ".ics", to_ics(ev), create_only=True)
